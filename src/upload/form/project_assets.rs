@@ -1,6 +1,10 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use failure::format_err;
+use ignore::types::{Types, TypesBuilder};
+use ignore::WalkBuilder;
+use path_slash::PathExt; // Path::to_slash()
+use serde::{Deserialize, Serialize};
 
 use super::binding::Binding;
 use super::filestem_from_path;
@@ -9,6 +13,8 @@ use super::text_blob::TextBlob;
 use super::wasm_module::WasmModule;
 
 use crate::settings::toml::{migrations::ApiMigration, DurableObjectsClass, KvNamespace};
+
+use std::collections::HashMap;
 
 #[derive(Debug)]
 pub struct ServiceWorkerAssets {
@@ -81,48 +87,18 @@ impl ServiceWorkerAssets {
     }
 }
 
+#[derive(Debug, PartialEq, PartialOrd, Eq, Ord)]
 pub struct Module {
     pub name: String,
     pub path: PathBuf,
     pub module_type: ModuleType,
 }
 
-impl Module {
-    pub fn new(name: String, path: PathBuf) -> Result<Module, failure::Error> {
-        let extension = path
-            .extension()
-            .ok_or_else(|| {
-                failure::err_msg(format!(
-                    "File {} lacks an extension. An extension is required to determine module type",
-                    path.display()
-                ))
-            })?
-            .to_string_lossy();
-
-        let module_type = match extension.as_ref() {
-            "mjs" => ModuleType::ES6,
-            "js" => ModuleType::CommonJS,
-            "wasm" => ModuleType::Wasm,
-            "txt" => ModuleType::Text,
-            "bin" => ModuleType::Data,
-            unknown => failure::bail!(format!(
-                "unknown extension {}, cannot determine module type",
-                unknown
-            )),
-        };
-
-        Ok(Module {
-            name,
-            path,
-            module_type,
-        })
-    }
-}
-
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd, Eq, Ord)]
 pub enum ModuleType {
-    ES6,
+    ESModule,
     CommonJS,
-    Wasm,
+    CompiledWasm,
     Text,
     Data,
 }
@@ -130,12 +106,144 @@ pub enum ModuleType {
 impl ModuleType {
     pub fn content_type(&self) -> &str {
         match &self {
-            Self::ES6 => "application/javascript+module",
+            Self::ESModule => "application/javascript+module",
             Self::CommonJS => "application/javascript",
-            Self::Wasm => "application/wasm",
+            Self::CompiledWasm => "application/wasm",
             Self::Text => "text/plain",
             Self::Data => "application/octet-stream",
         }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct ModuleGlobs {
+    esm: Option<Vec<String>>,
+    cjs: Option<Vec<String>>,
+    text: Option<Vec<String>>,
+    data: Option<Vec<String>>,
+    compiled_wasm: Option<Vec<String>>,
+}
+
+struct ModuleMatcher {
+    matcher: Types,
+    module_type: ModuleType,
+}
+
+impl ModuleGlobs {
+    pub fn find_modules(&self, upload_dir: &Path) -> Result<Vec<Module>, failure::Error> {
+        let (all_matcher, matchers) = self.build_type_matchers()?;
+
+        let candidates_vec = WalkBuilder::new(upload_dir)
+            .standard_filters(false)
+            .follow_links(true)
+            .types(all_matcher)
+            .build()
+            .collect::<Result<Vec<_>, _>>()?;
+        let candidates = candidates_vec
+            .iter()
+            .filter(|e| e.path().is_file())
+            .map(|e| e.path());
+
+        Self::create_module_manifest(candidates, upload_dir, matchers.as_slice())
+    }
+
+    fn create_module_manifest<'a>(
+        paths: impl Iterator<Item = &'a Path>,
+        upload_dir: &'a Path,
+        matchers: &'a [ModuleMatcher],
+    ) -> Result<Vec<Module>, failure::Error> {
+        let mut modules: HashMap<String, Module> = HashMap::new();
+
+        for path in paths {
+            let name = format!(
+                "./{}",
+                path.strip_prefix(upload_dir).map(|p| p.to_slash_lossy())?
+            );
+            for ModuleMatcher {
+                matcher,
+                module_type,
+            } in matchers
+            {
+                if matcher.matched(path, false).is_whitelist() {
+                    if modules.contains_key(&name) {
+                        failure::bail!(
+                            "The module at {} matched multiple module type globs.",
+                            path.display()
+                        );
+                    } else {
+                        modules.insert(
+                            name.to_string(),
+                            Module {
+                                name: name.to_string(),
+                                path: path.to_path_buf(),
+                                module_type: *module_type,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok(modules.drain().map(|(_, m)| m).collect())
+    }
+
+    fn build_type_matchers(&self) -> Result<(Types, Vec<ModuleMatcher>), failure::Error> {
+        let mut matchers = Vec::new();
+        let mut all_builder = TypesBuilder::new();
+
+        macro_rules! add_globs {
+            ($name:ident, $module_type:ident) => {
+                let empty_slice: &[&str] = &[];
+                add_globs!($name, $module_type, empty_slice);
+            };
+            ($name:ident, $module_type:ident, $default_globs:expr) => {
+                let mut builder = TypesBuilder::new();
+                if let Some($name) = &self.$name {
+                    for glob in $name {
+                        all_builder.add(stringify!($module_type), &glob)?;
+                        builder.add(stringify!($module_type), &glob)?;
+                    }
+                } else {
+                    for glob in $default_globs {
+                        all_builder.add(stringify!($module_type), glob)?;
+                        builder.add(stringify!($module_type), glob)?;
+                    }
+                }
+                builder.select("all");
+                matchers.push(ModuleMatcher {
+                    matcher: builder.build()?,
+                    module_type: ModuleType::$module_type,
+                });
+            };
+        }
+
+        let mut add_all_globs = || -> Result<(), ignore::Error> {
+            add_globs!(esm, ESModule, &["*.mjs"]);
+            add_globs!(cjs, CommonJS, &["*.js", "*.cjs"]);
+            add_globs!(compiled_wasm, CompiledWasm); // No default for non-standard wasm module type
+            add_globs!(text, Text, &["*.txt"]);
+            add_globs!(data, Data, &["*.bin"]); // TODO(now): Is this a good default?
+            all_builder.select("all");
+            Ok(())
+        };
+
+        match add_all_globs() {
+            Ok(()) => (),
+            Err(ignore::Error::Glob {
+                glob: Some(glob),
+                err,
+            }) => failure::bail!(
+                "encountered error while parsing the glob \"{}\": {}",
+                glob,
+                err
+            ),
+            Err(ignore::Error::Glob { glob: None, err }) => {
+                failure::bail!("encountered error while parsing globs: {}", err)
+            }
+            Err(e) => failure::bail!(e),
+        }
+
+        Ok((all_builder.build()?, matchers))
     }
 }
 
@@ -187,5 +295,52 @@ impl ModulesAssets {
         }
 
         bindings
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_module_parsing() -> Result<(), failure::Error> {
+        use super::ModuleType::*;
+
+        let upload_dir = Path::new("/worker/dist");
+
+        let fs = &[
+            (
+                "/worker/dist/foo/bar/index.mjs",
+                "./foo/bar/index.mjs",
+                ESModule,
+            ),
+            ("/worker/dist/bar.js", "./bar.js", CommonJS),
+            ("/worker/dist/foo/baz.cjs", "./foo/baz.cjs", CommonJS),
+            ("/worker/dist/wat.txt", "./wat.txt", Text),
+            ("/worker/dist/wat.bin", "./wat.bin", Data),
+        ];
+
+        let paths = fs.iter().map(|m| Path::new(m.0));
+        let mut modules = fs
+            .iter()
+            .map(|m| Module {
+                path: PathBuf::from(m.0),
+                name: m.1.to_string(),
+                module_type: m.2,
+            })
+            .collect::<Vec<_>>();
+        let globs: ModuleGlobs = ModuleGlobs::default();
+        let (_, matchers) = globs.build_type_matchers()?;
+
+        let mut manifest = ModuleGlobs::create_module_manifest(paths, upload_dir, &matchers)?;
+
+        modules.sort();
+        manifest.sort();
+
+        println!("{:#?}", manifest);
+
+        assert!(manifest.iter().eq(modules.iter()));
+
+        Ok(())
     }
 }

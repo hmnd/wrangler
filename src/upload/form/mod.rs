@@ -5,17 +5,15 @@ mod service_worker;
 mod text_blob;
 mod wasm_module;
 
-use path_slash::PathExt; // Path::to_slash()
+pub use project_assets::ModuleGlobs;
+
 use reqwest::blocking::multipart::Form;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 
-use ignore::overrides::{Override, OverrideBuilder};
-use ignore::WalkBuilder;
-
 use crate::settings::binding;
-use crate::settings::toml::{Builder, ScriptFormat, Target, TargetType};
+use crate::settings::toml::{Target, TargetType, UploadFormat};
 use crate::sites::AssetManifest;
 use crate::wranglerjs;
 
@@ -92,8 +90,8 @@ pub fn build(
             service_worker::build_form(&assets, session_config)
         }
         TargetType::JavaScript => match &target.build {
-            Some(config) => match &config.upload_format {
-                ScriptFormat::ServiceWorker => {
+            Some(config) => match &config.upload {
+                UploadFormat::ServiceWorker => {
                     log::info!("Plain JavaScript project detected. Publishing...");
                     let package_dir = target.package_dir()?;
                     let package = Package::new(&package_dir)?;
@@ -110,38 +108,8 @@ pub fn build(
 
                     service_worker::build_form(&assets, session_config)
                 }
-                ScriptFormat::Modules => {
-                    let package_dir = target.package_dir()?;
-                    let package = Package::new(&package_dir)?;
-                    let main_module = package.module(&package_dir)?;
-                    let main_module_name = filename_from_path(&main_module)
-                        .ok_or_else(|| failure::err_msg("filename required for main module"))?;
-
-                    let ignore = build_ignore(config, &package_dir)?;
-                    let modules_iter = WalkBuilder::new(config.upload_dir.clone())
-                        .standard_filters(false)
-                        .hidden(true)
-                        .overrides(ignore)
-                        .build();
-
-                    let mut modules: Vec<Module> = vec![];
-
-                    for entry in modules_iter {
-                        let entry = entry?;
-                        let path = entry.path();
-                        if path.is_file() {
-                            let name = modulename_from_path(&config.upload_dir, path).ok_or_else(
-                                || {
-                                    failure::err_msg(format!(
-                                        "failed to create module name for {}",
-                                        path.display()
-                                    ))
-                                },
-                            )?;
-                            log::info!("Adding module {} at path {}", name, path.display());
-                            modules.push(Module::new(name, path.to_owned())?);
-                        }
-                    }
+                UploadFormat::Modules { main, dir, globs } => {
+                    let modules: Vec<Module> = globs.find_modules(dir)?;
 
                     let migration = match &target.migrations {
                         Some(migrations) => Some(migrations.api_migration()?),
@@ -149,7 +117,7 @@ pub fn build(
                     };
 
                     let assets = ModulesAssets::new(
-                        main_module_name,
+                        main.to_string(),
                         modules,
                         kv_namespaces.to_vec(),
                         durable_object_classes,
@@ -216,23 +184,6 @@ fn filestem_from_path(path: &PathBuf) -> Option<String> {
     path.file_stem()?.to_str().map(|s| s.to_string())
 }
 
-fn filename_from_path(path: &PathBuf) -> Option<String> {
-    path.file_name()
-        .map(|filename| filename.to_string_lossy().into_owned())
-}
-
-/// Converts a system path into a Unix-style path, relative to some root.
-///
-/// # Example
-/// let root_path = Path::new("/Users/alice/Desktop/myproject");
-/// let path = Path::new("/Users/alice/Desktop/myproject/src/resources/file.txt");
-/// let result = modulename_from_path(&root_path, &path);
-///
-/// assert_eq!(result, Some(String::new("./src/resources/file.txt")));
-fn modulename_from_path(root_path: &Path, path: &Path) -> Option<String> {
-    Some(format!("./{}", path.strip_prefix(root_path).ok()?.to_owned().to_slash()?))
-}
-
 fn build_generated_dir() -> Result<(), failure::Error> {
     let dir = "./worker/generated";
     if !Path::new(dir).is_dir() {
@@ -251,22 +202,4 @@ fn concat_js(name: &str) -> Result<(), failure::Error> {
 
     fs::write("./worker/generated/script.js", js.as_bytes())?;
     Ok(())
-}
-
-fn build_ignore(config: &Builder, directory: &Path) -> Result<Override, failure::Error> {
-    let mut overrides = OverrideBuilder::new(directory);
-    // If `include` present, use it and don't touch the `exclude` field
-    if let Some(included) = &config.upload_include {
-        for i in included {
-            overrides.add(&i)?;
-            log::info!("Including {}", i);
-        }
-    } else if let Some(excluded) = &config.upload_exclude {
-        for e in excluded {
-            overrides.add(&format!("!{}", e))?;
-            log::info!("Ignoring {}", e);
-        }
-    }
-
-    Ok(overrides.build()?)
 }
